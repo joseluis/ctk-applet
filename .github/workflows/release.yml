@@ -1,0 +1,71 @@
+name: build-ctk-applet
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin_name: ctk-applet
+            asset_name: ctk-applet-linux-x86_64.tar.gz
+
+          - os: macos-15-intel
+            bin_name: ctk-applet
+            asset_name: ctk-applet-macos-x86_64.tar.gz
+
+          - os: macos-15
+            bin_name: ctk-applet
+            asset_name: ctk-applet-macos-aarch64.tar.gz
+
+          - os: windows-latest
+            bin_name: ctk-applet.exe
+            asset_name: ctk-applet-windows-x86_64.zip
+
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_DIR: ./target
+        run: cargo +nightly build -Zscript --manifest-path ctk-applet --release
+
+      - name: Package asset (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin_name }}" .
+          tar -czf "dist/${{ matrix.asset_name }}" "${{ matrix.bin_name }}"
+
+      - name: Package asset (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/release/${{ matrix.bin_name }}" -DestinationPath "dist/${{ matrix.asset_name }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+      - name: Upload asset to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "dist/${{ matrix.asset_name }}" --clobber

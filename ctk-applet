@@ -1,0 +1,638 @@
+#!/usr/bin/env -S cargo +nightly -Zscript
+---cargo
+[package]
+name = "ctk-applet"
+description = "A CLI for running archived Cut-the-Knot Java applets locally."
+repository = "https://github.com/joseluis/ctk-applet"
+authors = ["José Luis Cruz <joseluis@andamira.net>"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+[dependencies]
+reqwest = { version = "0.13", features = ["blocking"] }
+scraper = "0.25"
+url = "2.5"
+zip = "2"
+[profile.release]
+lto = true
+panic = "abort"
+strip = "symbols" # debuginfo, symbols
+opt-level = "s" # s, z
+---
+
+use scraper::{Html, Selector};
+use std::{
+    env,
+    error::Error,
+    fs, io,
+    path::{Path, PathBuf},
+    process::{Command, exit},
+};
+use url::Url;
+
+/* constants */
+
+const USAGE: &str = "\
+usage:
+\tctk-applet setup
+\tctk-applet list <url>
+\tctk-applet show <url> [--index N | --name CODE]
+\tctk-applet save <url> [--all | --index N | --name CODE] [--out-dir PATH]
+\tctk-applet run <url> [--index N | --name CODE]
+\tctk-applet run-file <path>";
+
+const CLASSES_DIR: &str = "classes";
+const CLASSES_ZIP: &str = "classes.zip";
+const CLASSES_ZIP_URL: &str = "https://github.com/edpegg/CutTheKnot-Java/raw/master/classes.zip";
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        exit(1);
+    }
+}
+
+/* parse args */
+
+#[derive(Debug, Default)]
+struct CommonArgs {
+    selector: Option<AppletSelector>,
+    all: bool,
+    out_dir: Option<PathBuf>,
+    positional: Vec<String>,
+}
+
+fn parse_common_args(args: impl Iterator<Item = String>) -> Result<CommonArgs, Box<dyn Error>> {
+    let mut out = CommonArgs::default();
+    let rest = args.collect::<Vec<_>>();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--index" => {
+                let n = rest.get(i + 1).ok_or("missing value after --index")?;
+                let n = n.parse::<usize>()?;
+                out.selector = Some(AppletSelector::Index(n));
+                i += 2;
+            }
+            "--name" => {
+                let name = rest.get(i + 1).ok_or("missing value after --name")?;
+                out.selector = Some(AppletSelector::Code(name.clone()));
+                i += 2;
+            }
+            "--all" => {
+                out.all = true;
+                i += 1;
+            }
+            "--out-dir" => {
+                let path = rest.get(i + 1).ok_or("missing value after --out-dir")?;
+                out.out_dir = Some(PathBuf::from(path));
+                i += 2;
+            }
+            s if s.starts_with('-') => {
+                return Err(format!("unknown option: {s}").into());
+            }
+            _ => {
+                out.positional.push(rest[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let mut args = env::args().skip(1);
+    match args.next().as_deref() {
+        Some("setup") => {
+            if args.next().is_some() {
+                return Err(format!("too many arguments\n{USAGE}").into());
+            }
+            ensure_classes_ready()?;
+            match require_appletviewer() {
+                Ok(()) => println!("appletviewer is available"),
+                Err(e) => println!("{e}"),
+            }
+        }
+        Some("list") => {
+            let parsed = parse_common_args(args)?;
+            if parsed.positional.len() != 1
+                || parsed.selector.is_some()
+                || parsed.all
+                || parsed.out_dir.is_some()
+            {
+                return Err(format!("usage:\n\tctk-applet list <url>").into());
+            }
+            let url = &parsed.positional[0];
+            let html = fetch_page(url)?;
+            let applets = extract_applets(&html, Some(url))?;
+
+            println!("{} applet(s) found", applets.len());
+            if !applets.is_empty() {
+                print!("{}", applet_summary_lines(&applets));
+            }
+        }
+        Some("show") => {
+            let parsed = parse_common_args(args)?;
+            if parsed.positional.len() != 1 || parsed.all || parsed.out_dir.is_some() {
+                return Err(
+                    format!("usage:\n\tctk-applet show <url> [--index N | --name CODE]").into()
+                );
+            }
+            let url = &parsed.positional[0];
+            let html = fetch_page(url)?;
+            let applets = extract_applets(&html, Some(url))?;
+            let applet = resolve_applet(&applets, parsed.selector.as_ref())?;
+            println!(
+                "selected applet {} of {}: {}",
+                applet.ordinal + 1,
+                applets.len(),
+                applet_label(applet)
+            );
+            print_applet_detail(applet);
+        }
+        Some("save") => {
+            let parsed = parse_common_args(args)?;
+            if parsed.positional.len() != 1 {
+                return Err(format!(
+                    "usage:\n\tctk-applet save <url> [--all | --index N | --name CODE] [--out-dir PATH]"
+                )
+                .into());
+            }
+            if parsed.all && parsed.selector.is_some() {
+                return Err("use either --all or a selector, not both".into());
+            }
+            let url = &parsed.positional[0];
+            let parsed_url = Url::parse(url)?;
+            let html = fetch_page(url)?;
+            let applets = extract_applets(&html, Some(url))?;
+            let mut opts = SaveOptions::default();
+            if let Some(out_dir) = parsed.out_dir {
+                opts.out_dir = out_dir;
+            }
+            if parsed.all {
+                if applets.is_empty() {
+                    return Err("no applets found".into());
+                }
+                let mut count = 0usize;
+                for applet in &applets {
+                    let path = save_one_applet(applet, &parsed_url, &opts)?;
+                    println!("{}", path.display());
+                    count += 1;
+                }
+                println!("saved {count} applet(s)");
+            } else {
+                let applet = resolve_applet(&applets, parsed.selector.as_ref())?;
+                let path = save_one_applet(applet, &parsed_url, &opts)?;
+                println!("{}", path.display());
+                println!(
+                    "saved applet {} of {}: {}",
+                    applet.ordinal + 1,
+                    applets.len(),
+                    applet_label(applet)
+                );
+            }
+        }
+        Some("run") => {
+            let parsed = parse_common_args(args)?;
+            if parsed.positional.len() != 1 || parsed.all || parsed.out_dir.is_some() {
+                return Err(
+                    format!("usage:\n\tctk-applet run <url> [--index N | --name CODE]").into()
+                );
+            }
+            ensure_classes_ready()?;
+            require_appletviewer()?;
+            let url = &parsed.positional[0];
+            let parsed_url = Url::parse(url)?;
+            let html = fetch_page(url)?;
+            let applets = extract_applets(&html, Some(url))?;
+            let applet = resolve_applet(&applets, parsed.selector.as_ref())?;
+            println!(
+                "running applet {} of {}: {}",
+                applet.ordinal + 1,
+                applets.len(),
+                applet_label(applet)
+            );
+            let html_path = save_to_temp_applet(applet, &parsed_url)?;
+            run_appletviewer(&html_path)?;
+        }
+        Some("run-file") => {
+            let parsed = parse_common_args(args)?;
+            if parsed.positional.len() != 1
+                || parsed.selector.is_some()
+                || parsed.all
+                || parsed.out_dir.is_some()
+            {
+                return Err(format!("usage:\n\tctk-applet run-file <path>").into());
+            }
+            require_appletviewer()?;
+            run_appletviewer(Path::new(&parsed.positional[0]))?;
+        }
+        Some(cmd) => {
+            return Err(format!("unknown command: {cmd}\n{USAGE}").into());
+        }
+        None => {
+            return Err(USAGE.into());
+        }
+    }
+    Ok(())
+}
+
+/* setup */
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassesStatus {
+    Missing,
+    Incomplete,
+    Invalid,
+    Ready,
+}
+
+fn classes_status() -> Result<ClassesStatus, Box<dyn Error>> {
+    let dir = Path::new(CLASSES_DIR);
+    if !dir.exists() {
+        return Ok(ClassesStatus::Missing);
+    }
+    if !dir.is_dir() {
+        return Ok(ClassesStatus::Invalid);
+    }
+    let has_known_file =
+        dir.join("CTKUtility.zip").is_file() || dir.join("CTKGeometry.zip").is_file();
+    if has_known_file {
+        Ok(ClassesStatus::Ready)
+    } else {
+        Ok(ClassesStatus::Incomplete)
+    }
+}
+
+fn ensure_classes_ready() -> Result<(), Box<dyn Error>> {
+    match classes_status()? {
+        ClassesStatus::Ready => {
+            println!("classes directory already exists and looks usable");
+            return Ok(());
+        }
+        ClassesStatus::Missing => {
+            println!("classes directory not found");
+        }
+        ClassesStatus::Incomplete => {
+            println!("classes directory already exists but looks incomplete");
+        }
+        ClassesStatus::Invalid => {
+            return Err(format!("{CLASSES_DIR} exists but is not a directory").into());
+        }
+    }
+    let zip_path = Path::new(CLASSES_ZIP);
+    if !zip_path.is_file() {
+        println!("downloading {CLASSES_ZIP_URL}");
+        let response = reqwest::blocking::get(CLASSES_ZIP_URL)?.error_for_status()?;
+        let bytes = response.bytes()?;
+        fs::write(zip_path, &bytes)?;
+    } else {
+        println!("using existing {}", zip_path.display());
+    }
+    println!("extracting {}", zip_path.display());
+    extract_zip(zip_path, Path::new("."))?;
+    match classes_status()? {
+        ClassesStatus::Ready => {
+            println!("classes directory is now ready");
+            Ok(())
+        }
+        ClassesStatus::Missing => {
+            Err("extraction finished but classes directory is still missing".into())
+        }
+        ClassesStatus::Incomplete => {
+            Err("extraction finished but classes directory still looks incomplete".into())
+        }
+        ClassesStatus::Invalid => {
+            Err("classes path exists after extraction but is not a directory".into())
+        }
+    }
+}
+
+fn extract_zip(zip_path: &Path, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(out_dir)?;
+    let file = fs::File::open(zip_path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let Some(name) = entry.enclosed_name().map(|p| p.to_owned()) else {
+            continue;
+        };
+        let out_path = out_dir.join(name);
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out_file = fs::File::create(&out_path)?;
+            io::copy(&mut entry, &mut out_file)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_appletviewer() -> Result<(), Box<dyn Error>> {
+    let result = Command::new("appletviewer").arg("-help").output();
+    match result {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "appletviewer is present but returned a non-zero status: {}",
+            output.status
+        ).into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Err("appletviewer not found in PATH.\nInstall JDK 8 and make sure appletviewer is available.".into())
+        }
+        Err(e) => Err(format!("failed to run appletviewer: {e}").into()),
+    }
+}
+
+/* webpage */
+
+fn fetch_page(url: &str) -> Result<String, Box<dyn Error>> {
+    let response = reqwest::blocking::get(url)?.error_for_status()?;
+    Ok(response.text()?)
+}
+
+fn extract_applets(
+    html: &str,
+    source_url: Option<&str>,
+) -> Result<Vec<AppletSpec>, Box<dyn Error>> {
+    let document = Html::parse_document(html);
+    let applet_sel = Selector::parse("applet")?;
+    let param_sel = Selector::parse("param")?;
+    let source_url = match source_url {
+        Some(s) => Some(Url::parse(s)?),
+        None => None,
+    };
+    let mut out = Vec::new();
+    for (ordinal, applet) in document.select(&applet_sel).enumerate() {
+        let value = |name: &str| applet.value().attr(name).map(str::to_owned);
+        let archive = value("archive")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut params = Vec::new();
+        for param in applet.select(&param_sel) {
+            let p = param.value();
+            let name = p.attr("name").unwrap_or("").trim();
+            let value = p.attr("value").unwrap_or("").trim();
+            if !name.is_empty() {
+                params.push((name.to_owned(), value.to_owned()));
+            }
+        }
+        out.push(AppletSpec {
+            code: value("code"),
+            codebase: value("codebase"),
+            archive,
+            width: value("width"),
+            height: value("height"),
+            params,
+            source_url: source_url.clone(),
+            ordinal,
+        });
+    }
+    Ok(out)
+}
+
+/* applets */
+
+#[derive(Debug)]
+struct AppletSpec {
+    code: Option<String>,
+    codebase: Option<String>,
+    archive: Vec<String>,
+    width: Option<String>,
+    height: Option<String>,
+    params: Vec<(String, String)>,
+    source_url: Option<Url>,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone)]
+enum AppletSelector {
+    Index(usize),
+    Code(String),
+}
+
+fn applet_label(a: &AppletSpec) -> &str {
+    a.code.as_deref().unwrap_or("Applet")
+}
+
+fn applet_summary_lines(applets: &[AppletSpec]) -> String {
+    let mut s = String::new();
+    for a in applets {
+        s.push_str(&format!("[{}] code={}", a.ordinal, applet_label(a)));
+        if !a.archive.is_empty() {
+            s.push_str(&format!(" archive={}", a.archive.join(",")));
+        }
+        match (&a.width, &a.height) {
+            (Some(w), Some(h)) => s.push_str(&format!(" size={}x{}", w, h)),
+            (Some(w), None) => s.push_str(&format!(" width={w}")),
+            (None, Some(h)) => s.push_str(&format!(" height={h}")),
+            (None, None) => {}
+        }
+        s.push('\n');
+    }
+    s
+}
+
+fn resolve_applet<'a>(
+    applets: &'a [AppletSpec],
+    selector: Option<&AppletSelector>,
+) -> Result<&'a AppletSpec, Box<dyn Error>> {
+    if applets.is_empty() {
+        return Err("no applets found".into());
+    }
+    match selector {
+        Some(sel) => select_applet(applets, sel),
+        None if applets.len() == 1 => Ok(&applets[0]),
+        None => Err(format!(
+            "multiple applets found, use --index or --name\n{}",
+            applet_summary_lines(applets)
+        )
+        .into()),
+    }
+}
+
+fn select_applet<'a>(
+    applets: &'a [AppletSpec],
+    selector: &AppletSelector,
+) -> Result<&'a AppletSpec, Box<dyn Error>> {
+    match selector {
+        AppletSelector::Index(n) => applets
+            .iter()
+            .find(|a| a.ordinal == *n)
+            .ok_or_else(|| format!("no applet found at index {n}").into()),
+        AppletSelector::Code(code) => {
+            let mut matches = applets.iter().filter(|a| a.code.as_deref() == Some(code.as_str()));
+            let first =
+                matches.next().ok_or_else(|| format!("no applet found with code {code:?}"))?;
+            if matches.next().is_some() {
+                return Err(
+                    format!("multiple applets found with code {code:?}, use --index").into()
+                );
+            }
+            Ok(first)
+        }
+    }
+}
+
+fn print_applet_detail(a: &AppletSpec) {
+    println!("[{}]", a.ordinal);
+    if let Some(code) = &a.code {
+        println!("  code: {code}");
+    }
+    if let Some(codebase) = &a.codebase {
+        println!("  codebase: {codebase}");
+    }
+    if !a.archive.is_empty() {
+        println!("  archive: {}", a.archive.join(", "));
+    }
+    match (&a.width, &a.height) {
+        (Some(w), Some(h)) => println!("  size: {w}x{h}"),
+        (Some(w), None) => println!("  width: {w}"),
+        (None, Some(h)) => println!("  height: {h}"),
+        (None, None) => {}
+    }
+    if !a.params.is_empty() {
+        println!("  params:");
+        for (name, value) in &a.params {
+            println!("    {name} = {value}");
+        }
+    }
+    if let Some(url) = &a.source_url {
+        println!("  source: {url}");
+    }
+}
+
+/* files */
+
+#[derive(Debug, Clone)]
+struct SaveOptions {
+    out_dir: PathBuf,
+}
+impl Default for SaveOptions {
+    fn default() -> Self {
+        Self { out_dir: PathBuf::from("saved") }
+    }
+}
+
+fn page_slug_from_url(url: &Url) -> String {
+    let last = url
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("index");
+    let stem = last.rsplit_once('.').map(|(a, _)| a).unwrap_or(last);
+    let mut out = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn applet_file_name(applet: &AppletSpec) -> String {
+    let code = applet.code.as_deref().unwrap_or("applet");
+    let mut clean = String::new();
+    for ch in code.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            clean.push(ch);
+        } else if !clean.ends_with('-') {
+            clean.push('-');
+        }
+    }
+    let clean = clean.trim_matches('-');
+    format!("{:02}-{}.html", applet.ordinal + 1, clean)
+}
+
+fn relative_path(from_file: &Path, to_dir: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let from_dir = from_file.parent().ok_or("output html path has no parent directory")?;
+    let from = fs::canonicalize(from_dir)?;
+    let to = fs::canonicalize(to_dir)?;
+    let from_parts = from.components().collect::<Vec<_>>();
+    let to_parts = to.components().collect::<Vec<_>>();
+    let common_len = from_parts.iter().zip(&to_parts).take_while(|(a, b)| a == b).count();
+    let mut rel = PathBuf::new();
+    for _ in common_len..from_parts.len() {
+        rel.push("..");
+    }
+    for comp in &to_parts[common_len..] {
+        rel.push(comp.as_os_str());
+    }
+    Ok(rel)
+}
+
+fn render_html(
+    spec: &AppletSpec,
+    output_html_path: &Path,
+    classes_dir: &Path,
+) -> Result<String, Box<dyn Error>> {
+    let rel_codebase = relative_path(output_html_path, classes_dir)?;
+    let rel_codebase = rel_codebase.to_string_lossy();
+    let code = spec.code.as_deref().unwrap_or("Applet");
+    let width = spec.width.as_deref().unwrap_or("640");
+    let height = spec.height.as_deref().unwrap_or("480");
+    let archive = spec.archive.join(",");
+    let mut out = String::new();
+    out.push_str("<html>\n  <body>\n");
+    out.push_str(&format!(
+        "    <applet code=\"{}\" codebase=\"{}\" archive=\"{}\" width=\"{}\" height=\"{}\">\n",
+        escape_html(code),
+        escape_html(&rel_codebase),
+        escape_html(&archive),
+        escape_html(width),
+        escape_html(height),
+    ));
+    for (name, value) in &spec.params {
+        out.push_str(&format!(
+            "      <param name=\"{}\" value=\"{}\">\n",
+            escape_html(name),
+            escape_html(value),
+        ));
+    }
+    out.push_str("    </applet>\n  </body>\n</html>\n");
+    Ok(out)
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn save_one_applet(
+    spec: &AppletSpec,
+    source_url: &Url,
+    opts: &SaveOptions,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let page_dir = opts.out_dir.join(page_slug_from_url(source_url));
+    fs::create_dir_all(&page_dir)?;
+    let output_path = page_dir.join(applet_file_name(spec));
+    let html = render_html(spec, &output_path, Path::new(CLASSES_DIR))?;
+    fs::write(&output_path, html)?;
+    Ok(output_path)
+}
+
+/* view */
+
+fn run_appletviewer(html_path: &Path) -> Result<(), Box<dyn Error>> {
+    let status = Command::new("appletviewer").arg(html_path).status()?;
+    if !status.success() {
+        return Err(format!("appletviewer exited with status {status}").into());
+    }
+    Ok(())
+}
+
+fn save_to_temp_applet(spec: &AppletSpec, source_url: &Url) -> Result<PathBuf, Box<dyn Error>> {
+    let temp_root = env::temp_dir().join("ctk-applet").join(page_slug_from_url(source_url));
+    fs::create_dir_all(&temp_root)?;
+    let output_path = temp_root.join(applet_file_name(spec));
+    let html = render_html(spec, &output_path, Path::new(CLASSES_DIR))?;
+    fs::write(&output_path, html)?;
+    Ok(output_path)
+}
