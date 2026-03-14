@@ -14,18 +14,27 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
             bin_name: ctk-applet
-            asset_name: ctk-applet-linux-x86_64.tar.gz
+            asset_name: ctk-applet-linux-x86_64-musl.tar.gz
+
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin_name: ctk-applet
+            asset_name: ctk-applet-linux-x86_64-gnu-ubuntu22.04.tar.gz
 
           - os: macos-15-intel
+            target: x86_64-apple-darwin
             bin_name: ctk-applet
             asset_name: ctk-applet-macos-x86_64.tar.gz
 
           - os: macos-15
+            target: aarch64-apple-darwin
             bin_name: ctk-applet
             asset_name: ctk-applet-macos-aarch64.tar.gz
 
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             bin_name: ctk-applet.exe
             asset_name: ctk-applet-windows-x86_64.zip
 
@@ -38,17 +47,25 @@ jobs:
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Build release binary
         env:
           CARGO_TARGET_DIR: ./target
-        run: cargo +nightly build -Zscript --manifest-path ctk-applet --release
+        run: cargo +nightly build -Zscript --manifest-path ctk-applet --release --target ${{ matrix.target }}
 
       - name: Package asset (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp "target/release/${{ matrix.bin_name }}" .
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" .
           tar -czf "dist/${{ matrix.asset_name }}" "${{ matrix.bin_name }}"
 
       - name: Package asset (Windows)
@@ -56,7 +73,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path "target/release/${{ matrix.bin_name }}" -DestinationPath "dist/${{ matrix.asset_name }}"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -DestinationPath "dist/${{ matrix.asset_name }}"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
