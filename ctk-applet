@@ -9,15 +9,16 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 [dependencies]
-reqwest = { version = "0.13", features = ["blocking"] }
-scraper = "0.25"
-url = "2.5"
-zip = "2"
+reqwest = { version = "0.13", default-features = false,
+    features = ["blocking", "rustls", "charset", "http2", "system-proxy"] }
+scraper = { version = "0.25", default-features = false }
+url = { version = "2.5", default-features = false }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 [profile.release]
 lto = true
 panic = "abort"
-strip = "symbols" # debuginfo, symbols
-opt-level = "s" # s, z
+strip = "symbols"
+opt-level = "s"
 ---
 
 use scraper::{Html, Selector};
