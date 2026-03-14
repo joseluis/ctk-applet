@@ -5,7 +5,7 @@ name = "ctk-applet"
 description = "A CLI for running archived Cut-the-Knot Java applets locally."
 repository = "https://github.com/joseluis/ctk-applet"
 authors = ["José Luis Cruz <joseluis@andamira.net>"]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 [dependencies]

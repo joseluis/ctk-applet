@@ -97,7 +97,7 @@ Download the binary for your platform from the [Releases] page.
 
 If you already have [Rust installed], you can also run the script directly.
 
-[Releases]: https://github.com/joseluis/ctk-applet/releases/latest
+[Releases]: https://github.com/joseluis/ctk-applet/releases
 [Rust installed]: https://rust-lang.org/tools/install/
 
 ## Quick start
