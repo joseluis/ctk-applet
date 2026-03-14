@@ -35,10 +35,8 @@ with `appletviewer`. A newer JDK is not enough.
 3. Download `ctk-applet`
 4. Run:
 
-```sh
-ctk-applet setup
-ctk-applet run https://www.cut-the-knot.org/ctk/May2001.shtml --name SilverDollar
-```
+    ctk-applet setup
+    ctk-applet run https://www.cut-the-knot.org/ctk/May2001.shtml --name SilverDollar
 
 ## Requirements
 
@@ -51,31 +49,42 @@ Install a Java 8 JDK that still includes `appletviewer`.
 
 ### Linux
 
-Use your distribution packages, Eclipse Temurin packages, or SDKMAN.
+Use your distribution packages when available.
 
-Example with SDKMAN:
+Ubuntu/Debian:
 
-```sh
-curl -s "https://get.sdkman.io" | bash
-source "$HOME/.sdkman/bin/sdkman-init.sh"
-sdk install java 8-tem
-```
+    sudo apt install openjdk-8-jdk
+
+Arch Linux:
+
+    sudo pacman -S jdk8-openjdk
+
+Fedora:
+
+    sudo dnf install java-1.8.0-openjdk-devel
+
+openSUSE:
+
+    sudo zypper install java-1_8_0-openjdk-devel
+
+You can also use SDKMAN instead of system packages:
+
+    curl -s "https://get.sdkman.io" | bash
+    source "$HOME/.sdkman/bin/sdkman-init.sh"
+    sdk list java
+    sdk install java 8.0.482-tem
 
 ### macOS
 
 With Homebrew:
 
-```sh
-brew install --cask temurin@8
-```
+    brew install --cask temurin@8
 
 Or with SDKMAN:
 
-```sh
-curl -s "https://get.sdkman.io" | bash
-source "$HOME/.sdkman/bin/sdkman-init.sh"
-sdk install java 8-tem
-```
+    curl -s "https://get.sdkman.io" | bash
+    source "$HOME/.sdkman/bin/sdkman-init.sh"
+    sdk install java 8-tem
 
 ### Windows
 
@@ -95,39 +104,27 @@ If you already have [Rust installed], you can also run the script directly.
 
 Prepare the local Java class archive once:
 
-```sh
-ctk-applet setup
-```
+    ctk-applet setup
 
 List the applets found on a page:
 
-```sh
-ctk-applet list https://www.cut-the-knot.org/ctk/May2001.shtml
-```
+    ctk-applet list https://www.cut-the-knot.org/ctk/May2001.shtml
 
 Show details for one applet:
 
-```sh
-ctk-applet show https://www.cut-the-knot.org/ctk/May2001.shtml --index 1
-```
+    ctk-applet show https://www.cut-the-knot.org/ctk/May2001.shtml --index 1
 
 Run one applet directly from the page URL:
 
-```sh
-ctk-applet run https://www.cut-the-knot.org/ctk/May2001.shtml --name SilverDollar
-```
+    ctk-applet run https://www.cut-the-knot.org/ctk/May2001.shtml --name SilverDollar
 
 Save launcher files for later use:
 
-```sh
-ctk-applet save https://www.cut-the-knot.org/ctk/May2001.shtml --all
-```
+    ctk-applet save https://www.cut-the-knot.org/ctk/May2001.shtml --all
 
 Run a previously saved launcher:
 
-```sh
-ctk-applet run-file saved/may2001/02-SilverDollar.html
-```
+    ctk-applet run-file saved/may2001/02-SilverDollar.html
 
 ## How selection works
 
@@ -141,14 +138,12 @@ If a page contains several applets, choose one explicitly with either:
 
 ## Commands
 
-```text
-ctk-applet setup
-ctk-applet list <url>
-ctk-applet show <url> [--index N | --name CODE]
-ctk-applet save <url> [--all | --index N | --name CODE] [--out-dir PATH]
-ctk-applet run <url> [--index N | --name CODE]
-ctk-applet run-file <path>
-```
+    ctk-applet setup
+    ctk-applet list <url>
+    ctk-applet show <url> [--index N | --name CODE]
+    ctk-applet save <url> [--all | --index N | --name CODE] [--out-dir PATH]
+    ctk-applet run <url> [--index N | --name CODE]
+    ctk-applet run-file <path>
 
 ## What each command does
 
